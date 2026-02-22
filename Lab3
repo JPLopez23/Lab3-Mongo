@@ -1,0 +1,429 @@
+// Laboratorio 3 
+
+use sample_analytics
+
+// Parte 1
+// Customers
+db.customers.findOne()
+// Accounts
+db.accounts.findOne()
+// Transactions - muestra la estructura con las primeras 2 transacciones del array
+db.transactions.aggregate([
+  { $limit: 1 },
+  { $addFields: { transactions: { $slice: ["$transactions", 2] } } }
+])
+
+//Parte 2
+// 2.1 Total de transacciones y monto promedio por cliente
+db.customers.aggregate([
+  {
+    $lookup: {
+      from: "accounts",
+      localField: "accounts",
+      foreignField: "account_id",
+      as: "customer_accounts"
+    }
+  },
+  { $unwind: "$customer_accounts" },
+  {
+    $lookup: {
+      from: "transactions",
+      localField: "customer_accounts.account_id",
+      foreignField: "account_id",
+      as: "tx_docs"
+    }
+  },
+  { $unwind: "$tx_docs" },
+  { $unwind: "$tx_docs.transactions" },
+  {
+    $group: {
+      _id: "$_id",
+      full_name: { $first: "$name" },
+      email: { $first: "$email" },
+      total_transactions: { $sum: 1 },
+      avg_amount: { $avg: "$tx_docs.transactions.amount" }
+    }
+  },
+  {
+    $project: {
+      _id: 0,
+      full_name: 1,
+      email: 1,
+      total_transactions: 1,
+      avg_amount: { $round: ["$avg_amount", 2] }
+    }
+  },
+  { $sort: { total_transactions: -1 } }
+]).toArray();
+
+// 2.2 Clasificar clientes según límite total de sus cuentas
+db.customers.aggregate([
+  {
+    $lookup: {
+      from: "accounts",
+      localField: "accounts",
+      foreignField: "account_id",
+      as: "customer_accounts"
+    }
+  },
+  {
+    $addFields: {
+      total_limit: { $sum: "$customer_accounts.limit" }
+    }
+  },
+  {
+    $project: {
+      _id: 0,
+      full_name: "$name",
+      email: 1,
+      total_limit: 1,
+      categoria: {
+        $switch: {
+          branches: [
+            { case: { $lt: ["$total_limit", 10000] }, then: "Bajo" },
+            { case: { $and: [{ $gte: ["$total_limit", 10000] }, { $lte: ["$total_limit", 30000] }] }, then: "Medio" },
+            { case: { $gt: ["$total_limit", 30000] }, then: "Alto" }
+          ],
+          default: "Sin clasificar"
+        }
+      }
+    }
+  },
+  { $sort: { full_name: 1 } }
+]).toArray();
+
+// 2.3 Cliente con mayor límite total por tier
+db.customers.aggregate([
+  {
+    $lookup: {
+      from: "accounts",
+      localField: "accounts",
+      foreignField: "account_id",
+      as: "customer_accounts"
+    }
+  },
+  {
+    $addFields: {
+      total_limit: { $sum: "$customer_accounts.limit" },
+      tier_array: { $objectToArray: "$tier_and_details" }
+    }
+  },
+  { $unwind: "$tier_array" },
+  {
+    $addFields: {
+      tier_name: "$tier_array.v.tier"
+    }
+  },
+  { $sort: { total_limit: -1 } },
+  {
+    $group: {
+      _id: "$tier_name",
+      full_name: { $first: "$name" },
+      email: { $first: "$email" },
+      total_limit: { $first: "$total_limit" }
+    }
+  },
+  {
+    $project: {
+      _id: 0,
+      tier: "$_id",
+      full_name: 1,
+      email: 1,
+      total_limit: 1
+    }
+  },
+  { $sort: { tier: 1 } }
+]).toArray();
+
+// 2.4 Top 10 transacciones más altas
+db.transactions.aggregate([
+  { $unwind: "$transactions" },
+  {
+    $match: {
+      "transactions.date": {
+        $gte: new Date("2016-01-01"),
+        $lte: new Date("2017-01-03")
+      }
+    }
+  },
+  { $sort: { "transactions.amount": -1 } },
+  { $limit: 10 },
+  {
+    $lookup: {
+      from: "customers",
+      let: { acc_id: "$account_id" },
+      pipeline: [
+        { $match: { $expr: { $in: ["$$acc_id", "$accounts"] } } },
+        { $project: { name: 1, email: 1, _id: 0 } }
+      ],
+      as: "customer_info"
+    }
+  },
+  { $unwind: { path: "$customer_info", preserveNullAndEmptyArrays: true } },
+  {
+    $project: {
+      _id: 0,
+      account_id: 1,
+      transaction_code: "$transactions.transaction_code",
+      symbol: "$transactions.symbol",
+      amount: "$transactions.amount",
+      date: "$transactions.date",
+      customer_name: "$customer_info.name",
+      customer_email: "$customer_info.email"
+    }
+  }
+]).toArray();
+
+// 2.5 Variación porcentual entre transacción más reciente y más antigua
+db.transactions.aggregate([
+  { $unwind: "$transactions" },
+  {
+    $group: {
+      _id: "$account_id",
+      all_txs: { $push: { date: "$transactions.date", amount: "$transactions.amount" } },
+      count: { $sum: 1 }
+    }
+  },
+  { $match: { count: { $gte: 2 } } },
+  {
+    $addFields: {
+      sorted_asc: { $sortArray: { input: "$all_txs", sortBy: { date: 1 } } }
+    }
+  },
+  {
+    $addFields: {
+      oldest: { $arrayElemAt: ["$sorted_asc", 0] },
+      newest: { $arrayElemAt: ["$sorted_asc", -1] }
+    }
+  },
+  {
+    $addFields: {
+      pct_variation: {
+        $multiply: [
+          { $divide: [{ $subtract: ["$newest.amount", "$oldest.amount"] }, "$oldest.amount"] },
+          100
+        ]
+      }
+    }
+  },
+  {
+    $lookup: {
+      from: "customers",
+      let: { acc_id: "$_id" },
+      pipeline: [
+        { $match: { $expr: { $in: ["$$acc_id", "$accounts"] } } },
+        { $project: { name: 1, _id: 0 } }
+      ],
+      as: "customer_info"
+    }
+  },
+  { $unwind: { path: "$customer_info", preserveNullAndEmptyArrays: true } },
+  {
+    $project: {
+      _id: 0,
+      account_id: "$_id",
+      customer_name: "$customer_info.name",
+      oldest_amount: "$oldest.amount",
+      oldest_date: "$oldest.date",
+      newest_amount: "$newest.amount",
+      newest_date: "$newest.date",
+      pct_variation: { $round: ["$pct_variation", 2] },
+      total_transactions: "$count"
+    }
+  },
+  { $sort: { pct_variation: -1 } }
+]).toArray();
+
+// 2.6 Agrupar transacciones por mes y tipo 
+db.transactions.aggregate([
+  { $unwind: "$transactions" },
+  {
+    $group: {
+      _id: {
+        month: { $dateToString: { format: "%Y-%m", date: "$transactions.date" } },
+        type: "$transactions.transaction_code"
+      },
+      total_amount: { $sum: "$transactions.amount" },
+      avg_amount: { $avg: "$transactions.amount" },
+      count: { $sum: 1 }
+    }
+  },
+  {
+    $project: {
+      _id: 0,
+      month: "$_id.month",
+      transaction_type: "$_id.type",
+      total_amount: { $round: ["$total_amount", 2] },
+      avg_amount: { $round: ["$avg_amount", 2] },
+      count: 1
+    }
+  },
+  { $sort: { month: 1, transaction_type: 1 } }
+]).toArray();
+
+// 2.7 Clientes sin ninguna transacción
+db.customers.aggregate([
+  {
+    $lookup: {
+      from: "transactions",
+      let: { accs: "$accounts" },
+      pipeline: [
+        { $match: { $expr: { $in: ["$account_id", "$$accs"] } } }
+      ],
+      as: "transactions_docs"
+    }
+  },
+  { $match: { transactions_docs: { $size: 0 } } },
+  {
+    $project: {
+      _id: 1,
+      name: 1,
+      email: 1,
+      accounts: 1
+    }
+  },
+  { $out: "inactive_customers" }
+]);
+// Verificar resultado:
+db.inactive_customers.countDocuments();
+
+// 2.8 Resumen por tipo de producto en accounts
+db.accounts.aggregate([
+  { $unwind: "$products" },
+  {
+    $group: {
+      _id: "$products",
+      total_accounts: { $sum: 1 },
+      avg_limit: { $avg: "$limit" },
+      total_limit: { $sum: "$limit" }
+    }
+  },
+  {
+    $project: {
+      _id: 0,
+      product: "$_id",
+      total_accounts: 1,
+      avg_limit: { $round: ["$avg_limit", 2] },
+      total_limit: { $round: ["$total_limit", 2] }
+    }
+  },
+  { $sort: { total_accounts: -1 } },
+  { $out: "account_summaries" }
+]);
+// Verificar resultado:
+db.account_summaries.find().toArray();
+
+// 2.9 Clientes de alto valor 
+db.customers.aggregate([
+  {
+    $lookup: {
+      from: "accounts",
+      localField: "accounts",
+      foreignField: "account_id",
+      as: "customer_accounts"
+    }
+  },
+  {
+    $addFields: {
+      total_limit: { $sum: "$customer_accounts.limit" }
+    }
+  },
+  {
+    $lookup: {
+      from: "transactions",
+      localField: "accounts",
+      foreignField: "account_id",
+      as: "tx_docs"
+    }
+  },
+  {
+    $addFields: {
+      total_transactions: {
+        $sum: {
+          $map: {
+            input: "$tx_docs",
+            as: "doc",
+            in: { $size: "$$doc.transactions" }
+          }
+        }
+      }
+    }
+  },
+  {
+    $match: {
+      total_limit: { $gt: 10000 },
+      total_transactions: { $gt: 5 }
+    }
+  },
+  {
+    $project: {
+      _id: 1,
+      name: 1,
+      email: 1,
+      total_limit: 1,
+      total_transactions: 1
+    }
+  },
+  { $out: "high_value_customers" }
+]);
+// Verificar resultado:
+db.high_value_customers.countDocuments();
+db.high_value_customers.find().limit(5).toArray();
+
+// 2.10 Promedio mensual de transacciones en el rango real del dataset
+db.customers.aggregate([
+  {
+    $lookup: {
+      from: "transactions",
+      localField: "accounts",
+      foreignField: "account_id",
+      as: "tx_docs"
+    }
+  },
+  { $unwind: "$tx_docs" },
+  { $unwind: "$tx_docs.transactions" },
+  {
+    $match: {
+      "tx_docs.transactions.date": {
+        $gte: new Date("2016-01-01"),
+        $lte: new Date("2017-01-03")
+      }
+    }
+  },
+  {
+    $group: {
+      _id: "$_id",
+      full_name: { $first: "$name" },
+      total_tx_period: { $sum: 1 }
+    }
+  },
+  {
+    $addFields: {
+      monthly_avg: { $divide: ["$total_tx_period", 12] }
+    }
+  },
+  {
+    $addFields: {
+      categoria: {
+        $switch: {
+          branches: [
+            { case: { $lt: ["$monthly_avg", 2] }, then: "infrequent" },
+            { case: { $and: [{ $gte: ["$monthly_avg", 2] }, { $lte: ["$monthly_avg", 5] }] }, then: "regular" },
+            { case: { $gt: ["$monthly_avg", 5] }, then: "frequent" }
+          ],
+          default: "infrequent"
+        }
+      }
+    }
+  },
+  {
+    $project: {
+      _id: 0,
+      full_name: 1,
+      total_tx_period: 1,
+      monthly_avg: { $round: ["$monthly_avg", 1] },
+      categoria: 1
+    }
+  },
+  { $sort: { monthly_avg: -1 } }
+]).toArray();
